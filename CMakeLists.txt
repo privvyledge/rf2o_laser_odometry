@@ -1,7 +1,6 @@
 cmake_minimum_required(VERSION 3.5)
 project(rf2o_laser_odometry)
 
-
 if(NOT CMAKE_CXX_STANDARD)
   set(CMAKE_CXX_STANDARD 14)
 endif()
@@ -12,6 +11,8 @@ endif()
 
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(rclcpp_components REQUIRED)
+find_package(class_loader REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
@@ -25,51 +26,58 @@ find_package(Boost REQUIRED)
 find_package(eigen3_cmake_module REQUIRED)
 find_package(Eigen3 REQUIRED)
 
-
-set(EXECUTABLE_NAME "rf2o_laser_odometry_node")
-
-## Specify additional locations of header files
-## Your package locations should be listed before other locations
-add_executable(${EXECUTABLE_NAME} 
-    src/CLaserOdometry2DNode.cpp
-    src/CLaserOdometry2D.cpp)
-
 include_directories(
-  include include/
+  include
 )
 
 include_directories(  
   ${Boost_INCLUDE_DIRS}
-  ##${EIGEN3_INCLUDE_DIRS}
 )
 
 set(DEPENDENCIES
-  "rclcpp"           
-  "std_msgs"         
-  "geometry_msgs" 
+  "rclcpp"
+  "rclcpp_components"
+  "class_loader"
+  "std_msgs"
+  "geometry_msgs"
   "tf2_geometry_msgs"
   "tf2"
   "tf2_ros"
   "sensor_msgs"
   "nav_msgs"
-  "eigen3_cmake_module"
 )
 
-##target_include_directories(${PROJECT_NAME} PUBLIC ${Eigen3_INCLUDE_DIRS})
-ament_target_dependencies(${EXECUTABLE_NAME} ${DEPENDENCIES})
+## Declare the component library
+add_library(${PROJECT_NAME}_component SHARED
+  src/CLaserOdometry2DNode.cpp
+  src/CLaserOdometry2D.cpp
+)
+target_include_directories(${PROJECT_NAME}_component PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>
+  ${Eigen3_INCLUDE_DIRS}
+)
+ament_target_dependencies(${PROJECT_NAME}_component ${DEPENDENCIES})
 
-## Declare a cpp library
-add_library(${PROJECT_NAME} src/CLaserOdometry2D.cpp)
+rclcpp_components_register_node(${PROJECT_NAME}_component
+  PLUGIN "rf2o::CLaserOdometry2DNode"
+  EXECUTABLE rf2o_laser_odometry_node
+)
 
-## Declare a cpp executable
-ament_target_dependencies(${PROJECT_NAME} ${DEPENDENCIES})
+## Install
+install(TARGETS ${PROJECT_NAME}_component
+  ARCHIVE DESTINATION lib
+  LIBRARY DESTINATION lib
+  RUNTIME DESTINATION bin
+)
 
-install(TARGETS ${EXECUTABLE_NAME}
-  DESTINATION lib/${PROJECT_NAME})
+install(
+  DIRECTORY include/
+  DESTINATION include
+)
 
 install(
   DIRECTORY launch  
   DESTINATION share/${PROJECT_NAME})
 
 ament_package()
-

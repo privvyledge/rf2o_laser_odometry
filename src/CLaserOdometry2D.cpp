@@ -17,17 +17,56 @@
 
 #include "rf2o_laser_odometry/CLaserOdometry2D.hpp"
 
+#include <cmath>
+#include <limits>
+
 namespace rf2o {
+
+namespace {
+constexpr float kEpsilon = 1e-6f;
+
+bool solveNormalEquations(const Eigen::MatrixXf& AtA,
+                          const Eigen::MatrixXf& AtB,
+                          Eigen::MatrixXf& solution,
+                          Eigen::MatrixXf* inverse_ata)
+{
+  if (!AtA.allFinite() || !AtB.allFinite())
+    return false;
+
+  Eigen::ColPivHouseholderQR<Eigen::MatrixXf> solver(AtA);
+  solver.setThreshold(kEpsilon);
+  if (solver.rank() < AtA.cols())
+    return false;
+
+  solution = solver.solve(AtB);
+  if (!solution.allFinite())
+    return false;
+
+  if (inverse_ata != nullptr)
+  {
+    *inverse_ata = solver.solve(Eigen::MatrixXf::Identity(AtA.rows(), AtA.cols()));
+    if (!inverse_ata->allFinite())
+      return false;
+  }
+
+  return true;
+}
+}
 
 
 /**
  * Constructor that inherits from Node
 */
-CLaserOdometry2D::CLaserOdometry2D() :
-  Node("CLaserOdometry2D"),
+CLaserOdometry2D::CLaserOdometry2D(const rclcpp::Logger& logger,
+                                   const rclcpp::Clock::SharedPtr& clock) :
+  logger_(logger),
+  clock_(clock ? clock : std::make_shared<rclcpp::Clock>(RCL_ROS_TIME)),
   verbose(false),
   module_initialized(false),
   first_laser_scan(true),
+  lin_speed(0.0),
+  lin_speed_y(0.0),
+  ang_speed(0.0),
   last_increment_(Pose3d::Identity()),
   laser_pose_on_robot_(Pose3d::Identity()),
   laser_pose_on_robot_inv_(Pose3d::Identity()),
@@ -61,14 +100,28 @@ bool CLaserOdometry2D::is_initialized()
  * On the first laser scan, gets its parameters and initialize the node
  * 
 */
-void CLaserOdometry2D::init(const sensor_msgs::msg::LaserScan& scan,
+bool CLaserOdometry2D::init(const sensor_msgs::msg::LaserScan& scan,
                             const geometry_msgs::msg::Pose& initial_robot_pose)
 {
   // Obtain laser parametes
-  RCLCPP_INFO(get_logger(), "Got first Laser Scan .... Configuring node");
+  RCLCPP_INFO(logger_, "Got first Laser Scan .... Configuring node");
   width = scan.ranges.size();         // Num of samples (size) of the scan laser
+  if (width < 3)
+  {
+    RCLCPP_WARN(logger_, "Laser scan must contain at least 3 ranges");
+    module_initialized = false;
+    return false;
+  }
+
   cols = width;						            // Max resolution. Should be similar to the width parameter
   fovh = std::abs(scan.angle_max - scan.angle_min);  // Horizontal Laser's FOV
+  if (!std::isfinite(fovh) || fovh <= 0.f)
+  {
+    RCLCPP_WARN(logger_, "Laser scan has invalid angular field of view");
+    module_initialized = false;
+    return false;
+  }
+
   ctf_levels = 5;                     // Coarse-to-Fine levels
   iter_irls  = 5;                     // Num iterations to solve iterative reweighted least squares
 
@@ -82,16 +135,21 @@ void CLaserOdometry2D::init(const sensor_msgs::msg::LaserScan& scan,
   robot_initial_pose.translation()(0) = initial_robot_pose.position.x;
   robot_initial_pose.translation()(1) = initial_robot_pose.position.y;
 
-  //RCLCPP_INFO_STREAM(get_logger(), "[rf2o] Setting origin at:\n"<< robot_initial_pose.matrix());
+  //RCLCPP_INFO_STREAM(logger_, "[rf2o] Setting origin at:\n"<< robot_initial_pose.matrix());
 
   // Get the initial laser pose assuming laser is fixed with respect the base_link
   laser_pose_    = robot_initial_pose * laser_pose_on_robot_;
-  laser_oldpose_ = laser_oldpose_;
+  laser_oldpose_ = laser_pose_;
+  robot_pose_    = robot_initial_pose;
+  robot_oldpose_ = robot_pose_;
 
 
   // Init rf2o module (internal)
   //-----------------------------
   range_wf = Eigen::MatrixXf::Constant(1, width, 1);
+  kai_loc_ = MatrixS31::Zero();
+  kai_loc_old_ = MatrixS31::Zero();
+  kai_loc_level_ = MatrixS31::Zero();
 
   // Resize vectors according to coarse2fine levels
   transformations.resize(ctf_levels);
@@ -163,8 +221,18 @@ void CLaserOdometry2D::init(const sensor_msgs::msg::LaserScan& scan,
   kai_abs_     = MatrixS31::Zero();
   kai_loc_old_ = MatrixS31::Zero();
 
+  if (!sanitizeScanRanges(scan))
+  {
+    RCLCPP_WARN(logger_, "Failed to sanitize initial laser scan");
+    module_initialized = false;
+    return false;
+  }
+
+  createImagePyramid();
+
   module_initialized = true;
   last_odom_time = scan.header.stamp;   // the time of this first scan
+  return true;
 }
 
 
@@ -191,6 +259,29 @@ const Pose3d& CLaserOdometry2D::getPose() const
   return robot_pose_;
 }
 
+bool CLaserOdometry2D::sanitizeScanRanges(const sensor_msgs::msg::LaserScan& scan)
+{
+  if (scan.ranges.size() != width || range_wf.size() != static_cast<int>(width))
+    return false;
+
+  const bool has_min = std::isfinite(scan.range_min);
+  const bool has_max = std::isfinite(scan.range_max);
+
+  for (unsigned int i = 0; i < width; ++i)
+  {
+    const float value = scan.ranges[i];
+    const bool invalid =
+      !std::isfinite(value) ||
+      value <= 0.f ||
+      (has_min && value < scan.range_min) ||
+      (has_max && value > scan.range_max);
+
+    range_wf(i) = invalid ? 0.f : value;
+  }
+
+  return true;
+}
+
 
 /**
  * Performs multilevel odometry calculation from a pair of scan lasers (previous-current)
@@ -203,16 +294,56 @@ bool CLaserOdometry2D::odometryCalculation(const sensor_msgs::msg::LaserScan& sc
   //	DIFERENTIAL  ODOMETRY  MULTILEVEL
   //=====================================
 
-  // copy @param scan to internal variable (we already did it for the previous scan)
-  range_wf = Eigen::Map<const Eigen::MatrixXf>(scan.ranges.data(), width, 1);
+  if (scan.ranges.size() != width)
+  {
+    RCLCPP_WARN_THROTTLE(
+      logger_, *clock_, 5000,
+      "Rejecting laser scan with width %zu; expected %u",
+      scan.ranges.size(), width);
+    return false;
+  }
+
+  current_scan_time = scan.header.stamp;
+  const double time_inc_sec = (current_scan_time - last_odom_time).seconds();
+  if (!std::isfinite(time_inc_sec) || time_inc_sec <= 0.0)
+  {
+    RCLCPP_WARN_THROTTLE(
+      logger_, *clock_, 5000,
+      "Rejecting laser scan with invalid dt: %.9f", time_inc_sec);
+    return false;
+  }
+
+  fps = static_cast<float>(1.0 / time_inc_sec);
+  if (!std::isfinite(fps) || fps <= 0.f)
+  {
+    RCLCPP_WARN_THROTTLE(logger_, *clock_, 5000, "Rejecting laser scan with invalid fps");
+    return false;
+  }
+
+  if (!sanitizeScanRanges(scan))
+  {
+    RCLCPP_WARN_THROTTLE(logger_, *clock_, 5000, "Rejecting laser scan that could not be sanitized");
+    return false;
+  }
 
   // Keep record of times
-  auto start = get_clock()->now();
+  auto start = clock_->now();
+
+  const auto previous_range = range;
+  const auto previous_xx = xx;
+  const auto previous_yy = yy;
+  const auto restore_previous_scan = [this, previous_range, previous_xx, previous_yy]()
+  {
+    range = previous_range;
+    xx = previous_xx;
+    yy = previous_yy;
+  };
 
   // Create pyramid from current scan
   createImagePyramid();
 
   // Coarse-to-fine scheme (pyramid lvls)
+  bool solved_any_level = false;
   for (unsigned int i=0; i<ctf_levels; i++)
   {
     // Clear previous computations
@@ -253,7 +384,11 @@ bool CLaserOdometry2D::odometryCalculation(const sensor_msgs::msg::LaserScan& sc
     // 7. Solve odometry
     if (num_valid_range > 3)
     {
-      solveSystemNonLinear();
+      if (!solveSystemNonLinear())
+      {
+        restore_previous_scan();
+        return false;
+      }
       //solveSystemOneLevel();    //without robust-function
     }
     else
@@ -268,12 +403,26 @@ bool CLaserOdometry2D::odometryCalculation(const sensor_msgs::msg::LaserScan& sc
     }
 
     // 8. Filter solution
-    if (!filterLevelSolution()) return false;
+    if (!filterLevelSolution())
+    {
+      restore_previous_scan();
+      return false;
+    }
+    solved_any_level = true;
   } // end pyramid lvls
 
+  if (!solved_any_level)
+  {
+    RCLCPP_WARN_THROTTLE(
+      logger_, *clock_, 5000,
+      "Rejecting laser scan with insufficient valid RF2O constraints");
+    restore_previous_scan();
+    return false;
+  }
+
   // Get computation time 
-  auto m_runtime = get_clock()->now() - start;
-  RCLCPP_INFO(get_logger(), "execution time (ms): %f",
+  auto m_runtime = clock_->now() - start;
+  RCLCPP_DEBUG(logger_, "execution time (ms): %f",
                 m_runtime.seconds()*double(1000));
 
   // Update poses with the new odom
@@ -323,15 +472,16 @@ void CLaserOdometry2D::createImagePyramid()
 
             for (int l=-2; l<3; l++)
             {
-              const float abs_dif = std::abs(range_wf(u+l)-dcenter);
-              if (abs_dif < max_range_dif)
+              const float neighbor = range_wf(u+l);
+              const float abs_dif = std::abs(neighbor-dcenter);
+              if (std::isfinite(neighbor) && neighbor > 0.f && abs_dif < max_range_dif)
               {
                 const float aux_w = g_mask[2+l]*(max_range_dif - abs_dif);
                 weight += aux_w;
-                sum += aux_w*range_wf(u+l);
+                sum += aux_w*neighbor;
               }
             }
-            range[i](u) = sum/weight;
+            range[i](u) = (weight > kEpsilon) ? sum/weight : 0.f;
           }
           else
             range[i](u) = 0.f;
@@ -347,19 +497,20 @@ void CLaserOdometry2D::createImagePyramid()
 
             for (int l=-2; l<3; l++)
             {
-              const int indu = u+l;
-              if ((indu>=0)&&(indu<int(cols_i)))
-              {
-                const float abs_dif = std::abs(range_wf(indu)-dcenter);
-                if (abs_dif < max_range_dif)
+                const int indu = u+l;
+                if ((indu>=0)&&(indu<int(cols_i)))
                 {
-                  const float aux_w = g_mask[2+l]*(max_range_dif - abs_dif);
-                  weight += aux_w;
-                  sum += aux_w*range_wf(indu);
+                  const float neighbor = range_wf(indu);
+                  const float abs_dif = std::abs(neighbor-dcenter);
+                  if (std::isfinite(neighbor) && neighbor > 0.f && abs_dif < max_range_dif)
+                  {
+                    const float aux_w = g_mask[2+l]*(max_range_dif - abs_dif);
+                    weight += aux_w;
+                    sum += aux_w*neighbor;
+                  }
                 }
               }
-            }
-            range[i](u) = sum/weight;
+            range[i](u) = (weight > kEpsilon) ? sum/weight : 0.f;
           }
           else
             range[i](u) = 0.f;
@@ -385,15 +536,20 @@ void CLaserOdometry2D::createImagePyramid()
 
             for (int l=-2; l<3; l++)
             {
-              const float abs_dif = std::abs(range[i_1](u2+l)-dcenter);
-              if (abs_dif < max_range_dif)
+              const int indu = u2+l;
+              if ((indu>=0)&&(indu<int(range[i_1].cols())))
               {
-                const float aux_w = g_mask[2+l]*(max_range_dif - abs_dif);
-                weight += aux_w;
-                sum += aux_w*range[i_1](u2+l);
+                const float neighbor = range[i_1](indu);
+                const float abs_dif = std::abs(neighbor-dcenter);
+                if (std::isfinite(neighbor) && neighbor > 0.f && abs_dif < max_range_dif)
+                {
+                  const float aux_w = g_mask[2+l]*(max_range_dif - abs_dif);
+                  weight += aux_w;
+                  sum += aux_w*neighbor;
+                }
               }
             }
-            range[i](u) = sum/weight;
+            range[i](u) = (weight > kEpsilon) ? sum/weight : 0.f;
           }
           else
             range[i](u) = 0.f;
@@ -415,16 +571,17 @@ void CLaserOdometry2D::createImagePyramid()
               const int indu = u2+l;
               if ((indu>=0)&&(indu<int(cols_i2)))
               {
-                const float abs_dif = std::abs(range[i_1](indu)-dcenter);
-                if (abs_dif < max_range_dif)
-                {
-                  const float aux_w = g_mask[2+l]*(max_range_dif - abs_dif);
-                  weight += aux_w;
-                  sum += aux_w*range[i_1](indu);
+                  const float abs_dif = std::abs(range[i_1](indu)-dcenter);
+                  const float neighbor = range[i_1](indu);
+                  if (std::isfinite(neighbor) && neighbor > 0.f && abs_dif < max_range_dif)
+                  {
+                    const float aux_w = g_mask[2+l]*(max_range_dif - abs_dif);
+                    weight += aux_w;
+                    sum += aux_w*neighbor;
+                  }
                 }
               }
-            }
-            range[i](u) = sum/weight;
+            range[i](u) = (weight > kEpsilon) ? sum/weight : 0.f;
           }
           else
             range[i](u) = 0.f;
@@ -434,11 +591,12 @@ void CLaserOdometry2D::createImagePyramid()
     }
 
     // Calculate coordinates "xy" of the points
+    const float angle_denominator = (cols_i > 1) ? float(cols_i-1) : 1.f;
     for (unsigned int u = 0; u < cols_i; u++)
     {
       if (range[i](u) > 0.f)
       {
-        const float tita = -0.5*fovh + float(u)*fovh/float(cols_i-1);
+        const float tita = -0.5*fovh + float(u)*fovh/angle_denominator;
         xx[i](u) = range[i](u)*std::cos(tita);
         yy[i](u) = range[i](u)*std::sin(tita);
       }
@@ -456,7 +614,10 @@ void CLaserOdometry2D::calculateCoord()
 {
   for (unsigned int u = 0; u < cols_i; u++)
   {
-    if ((range_old[image_level](u) == 0.f) || (range_warped[image_level](u) == 0.f))
+    if (!std::isfinite(range_old[image_level](u)) ||
+        !std::isfinite(range_warped[image_level](u)) ||
+        range_old[image_level](u) <= 0.f ||
+        range_warped[image_level](u) <= 0.f)
     {
       range_inter[image_level](u) = 0.f;
       xx_inter[image_level](u)    = 0.f;
@@ -475,6 +636,12 @@ void CLaserOdometry2D::calculateCoord()
 void CLaserOdometry2D::calculaterangeDerivativesSurface()
 {
   //The gradient size ir reserved at the maximum size (at the constructor)
+  if (cols_i < 3)
+  {
+    dtita.setZero();
+    dt.setZero();
+    return;
+  }
 
   //Compute connectivity
 
@@ -495,9 +662,17 @@ void CLaserOdometry2D::calculaterangeDerivativesSurface()
 
   //Spatial derivatives
   for (unsigned int u = 1; u < cols_i-1; u++)
-    dtita(u) = (rtita(u-1)*(range_inter[image_level](u+1)-
-                range_inter[image_level](u)) + rtita(u)*(range_inter[image_level](u) -
-        range_inter[image_level](u-1)))/(rtita(u)+rtita(u-1));
+  {
+    const float denominator = rtita(u)+rtita(u-1);
+    if (std::isfinite(denominator) && denominator > kEpsilon)
+    {
+      dtita(u) = (rtita(u-1)*(range_inter[image_level](u+1)-
+                  range_inter[image_level](u)) + rtita(u)*(range_inter[image_level](u) -
+          range_inter[image_level](u-1)))/denominator;
+    }
+    else
+      dtita(u) = 0.f;
+  }
 
   dtita(0) = dtita(1);
   dtita(cols_i-1) = dtita(cols_i-2);
@@ -562,6 +737,12 @@ void CLaserOdometry2D::computeWeights()
   //The maximum weight size is reserved at the constructor
   weights.setConstant(1, cols, 0.f);
 
+  if (!std::isfinite(fps) || fps <= kEpsilon)
+  {
+    num_valid_range = 0;
+    return;
+  }
+
   //Parameters for error_linearization
   const float kdtita = 1.f;
   const float kdt = kdtita / (fps*fps);
@@ -582,21 +763,58 @@ void CLaserOdometry2D::computeWeights()
           kdtita*(dtita(u)*dtita(u)) +
           k2d*(std::abs(dtitat) + std::abs(dtita2));
 
-      weights(u) = std::sqrt(1.f/w_der);
+      if (std::isfinite(w_der) && w_der > kEpsilon)
+      {
+        const float weight = std::sqrt(1.f/w_der);
+        weights(u) = std::isfinite(weight) ? weight : 0.f;
+      }
     }
 
-  const float inv_max = 1.f / weights.maxCoeff();
-  weights = inv_max*weights;
+  const float max_weight = weights.maxCoeff();
+  if (!std::isfinite(max_weight) || max_weight <= kEpsilon)
+  {
+    weights.setZero();
+    num_valid_range = 0;
+    return;
+  }
+
+  weights *= 1.f / max_weight;
+
+  num_valid_range = 0;
+  for (unsigned int u = 1; u < cols_i-1; u++)
+  {
+    if (null(u) == 0 && std::isfinite(weights(u)) && weights(u) > kEpsilon)
+      num_valid_range++;
+    else
+      null(u) = 1;
+  }
 }
 
 void CLaserOdometry2D::findNullPoints()
 {
   //Size of null matrix is set to its maximum size (constructor)
   num_valid_range = 0;
+  null.setConstant(1, cols, 1);
 
   for (unsigned int u = 1; u < cols_i-1; u++)
   {
-    if (range_inter[image_level](u) == 0.f)
+    // A point is only valid if its local neighborhood is valid
+    // This prevents huge derivative spikes at the edges of invalid regions
+    bool valid_neighborhood = true;
+    for (int l = -1; l <= 1; ++l)
+    {
+      int idx = static_cast<int>(u) + l;
+      if (idx >= 0 && idx < static_cast<int>(cols_i))
+      {
+        if (!std::isfinite(range_inter[image_level](idx)) || range_inter[image_level](idx) <= 0.f)
+        {
+          valid_neighborhood = false;
+          break;
+        }
+      }
+    }
+
+    if (!valid_neighborhood)
       null(u) = 1;
     else
     {
@@ -607,8 +825,11 @@ void CLaserOdometry2D::findNullPoints()
 }
 
 // Solves the system without considering any robust-function
-void CLaserOdometry2D::solveSystemOneLevel()
+bool CLaserOdometry2D::solveSystemOneLevel()
 {
+  if (num_valid_range <= 3)
+    return false;
+
   A.resize(num_valid_range, 3);
   B.resize(num_valid_range, 1);
 
@@ -638,19 +859,36 @@ void CLaserOdometry2D::solveSystemOneLevel()
   Eigen::MatrixXf AtA, AtB;
   AtA = A.transpose()*A;
   AtB = A.transpose()*B;
-  Var = AtA.ldlt().solve(AtB);
+  Eigen::MatrixXf solution;
+  Eigen::MatrixXf inv_ata;
+  if (!solveNormalEquations(AtA, AtB, solution, &inv_ata))
+    return false;
+  Var = solution;
 
   //Covariance matrix calculation 	Cov Order -> vx,vy,wz
   Eigen::MatrixXf res(num_valid_range,1);
   res = A*Var - B;
-  cov_odo = (1.f/float(num_valid_range-3))*AtA.inverse()*res.squaredNorm();
+  if (!res.allFinite())
+    return false;
+
+  const float cov_scale = res.squaredNorm() / float(num_valid_range-3);
+  if (!std::isfinite(cov_scale))
+    return false;
+
+  cov_odo = cov_scale * inv_ata;
+  if (!cov_odo.allFinite())
+    return false;
 
   kai_loc_level_ = Var;
+  return true;
 }
 
 // Solves the system by considering the Cauchy M-estimator robust-function
-void CLaserOdometry2D::solveSystemNonLinear()
+bool CLaserOdometry2D::solveSystemNonLinear()
 {
+  if (num_valid_range <= 3)
+    return false;
+
   A.resize(num_valid_range, 3); Aw.resize(num_valid_range, 3);
   B.resize(num_valid_range, 1); Bw.resize(num_valid_range, 1);
   unsigned int cont = 0;
@@ -679,28 +917,36 @@ void CLaserOdometry2D::solveSystemNonLinear()
   Eigen::MatrixXf AtA, AtB;
   AtA = A.transpose()*A;
   AtB = A.transpose()*B;
-  Var = AtA.ldlt().solve(AtB);
+  Eigen::MatrixXf solution;
+  Eigen::MatrixXf inv_ata;
+  if (!solveNormalEquations(AtA, AtB, solution, nullptr))
+    return false;
+  Var = solution;
 
   //Covariance matrix calculation 	Cov Order -> vx,vy,wz
   Eigen::MatrixXf res(num_valid_range,1);
   res = A*Var - B;
+  if (!res.allFinite())
+    return false;
   //cout << endl << "max res: " << res.maxCoeff();
   //cout << endl << "min res: " << res.minCoeff();
 
   ////Compute the energy
   //Compute the average dt
-  float aver_dt = 0.f, aver_res = 0.f; unsigned int ind = 0;
+  float aver_dt = 0.f;
   for (unsigned int u = 1; u < cols_i-1; u++)
     if (null(u) == 0)
     {
       aver_dt  += std::abs(dt(u));
-      aver_res += std::abs(res(ind++));
     }
-  aver_dt /= cont; aver_res /= cont;
+  if (cont == 0)
+    return false;
+
+  aver_dt /= cont;
   //    printf("\n Aver dt = %f, aver res = %f", aver_dt, aver_res);
 
 
-  const float k = 10.f/aver_dt; //200
+  const float k = (std::isfinite(aver_dt) && aver_dt > kEpsilon) ? 10.f/aver_dt : 1.f; //200
   //float energy = 0.f;
   //for (unsigned int i=0; i<res.rows(); i++)
   //	energy += log(1.f + mrpt::math::square(k*res(i)));
@@ -715,7 +961,9 @@ void CLaserOdometry2D::solveSystemNonLinear()
     for (unsigned int u = 1; u < cols_i-1; u++)
       if (null(u) == 0)
       {
-        const float res_weight = std::sqrt(1.f/(1.f + ((k*res(cont))*(k*res(cont)))));
+        const float robust_arg = k*res(cont);
+        const float res_weight = std::isfinite(robust_arg) ?
+          std::sqrt(1.f/(1.f + (robust_arg*robust_arg))) : 0.f;
 
         //Fill the matrix Aw
         Aw(cont,0) = res_weight*A(cont,0);
@@ -728,8 +976,12 @@ void CLaserOdometry2D::solveSystemNonLinear()
     //Solve the linear system of equations using a minimum least squares method
     AtA = Aw.transpose()*Aw;
     AtB = Aw.transpose()*Bw;
-    Var = AtA.ldlt().solve(AtB);
+    if (!solveNormalEquations(AtA, AtB, solution, nullptr))
+      return false;
+    Var = solution;
     res = A*Var - B;
+    if (!res.allFinite())
+      return false;
 
     ////Compute the energy
     //energy = 0.f;
@@ -738,10 +990,21 @@ void CLaserOdometry2D::solveSystemNonLinear()
     //printf("\nEnergy(%d) = %f", i, energy);
   }
 
-  cov_odo = (1.f/float(num_valid_range-3))*AtA.inverse()*res.squaredNorm();
-  kai_loc_level_ = Var;
+  if (!solveNormalEquations(AtA, AtB, solution, &inv_ata))
+    return false;
 
-  //RCLCPP_INFO_STREAM(get_logger(), "[rf2o] COV_ODO:\n" << cov_odo);
+  const float cov_scale = res.squaredNorm() / float(num_valid_range-3);
+  if (!std::isfinite(cov_scale))
+    return false;
+
+  cov_odo = cov_scale * inv_ata;
+  if (!cov_odo.allFinite())
+    return false;
+
+  kai_loc_level_ = Var;
+  return true;
+
+  //RCLCPP_INFO_STREAM(logger_, "[rf2o] COV_ODO:\n" << cov_odo);
 }
 
 void CLaserOdometry2D::Reset(const Pose3d& ini_pose/*, CObservation2DRangeScan scan*/)
@@ -816,7 +1079,7 @@ void CLaserOdometry2D::performWarping()
   //Scale the averaged range and compute coordinates
   for (unsigned int u = 0; u<cols_i; u++)
   {
-    if (wacu(u) > 0.f)
+    if (std::isfinite(wacu(u)) && wacu(u) > kEpsilon)
     {
       const float tita = -0.5f*fovh + float(u)/kdtita;
       range_warped[image_level](u) /= wacu(u);
@@ -834,12 +1097,18 @@ void CLaserOdometry2D::performWarping()
 
 bool CLaserOdometry2D::filterLevelSolution()
 {
+  if (!cov_odo.allFinite() || !kai_loc_level_.allFinite())
+  {
+    RCLCPP_WARN(logger_, "Non-finite RF2O solution. Pose is not updated");
+    return false;
+  }
+
   //		Calculate Eigenvalues and Eigenvectors
   //----------------------------------------------------------
   Eigen::SelfAdjointEigenSolver<Eigen::MatrixXf> eigensolver(cov_odo);
   if (eigensolver.info() != Eigen::Success)
   {
-    RCLCPP_WARN(get_logger(), "WARNING: Eigensolver couldn't find a solution. Pose is not updated");
+    RCLCPP_WARN(logger_, "WARNING: Eigensolver couldn't find a solution. Pose is not updated");
     return false;
   }
 
@@ -848,10 +1117,13 @@ bool CLaserOdometry2D::filterLevelSolution()
   Eigen::Matrix<float,3,3> Bii;
   Eigen::Matrix<float,3,1> kai_b;
   Bii = eigensolver.eigenvectors();
+  if (!Bii.allFinite() || !eigensolver.eigenvalues().allFinite())
+  {
+    RCLCPP_WARN(logger_, "Non-finite covariance eigensystem. Pose is not updated");
+    return false;
+  }
 
-  kai_b = Bii.colPivHouseholderQr().solve(kai_loc_level_);
-
-  assert((kai_loc_level_).isApprox(Bii*kai_b, 1e-5) && "Ax=b has no solution." && __LINE__);
+  kai_b = Bii.transpose()*kai_loc_level_;
 
   //Second, we have to describe both the old linear and angular speeds in the "eigenvector" basis too
   //-------------------------------------------------------------------------------------------------
@@ -873,10 +1145,11 @@ bool CLaserOdometry2D::filterLevelSolution()
   }
   kai_loc_sub += kai_loc_old_;
 
-  Eigen::Matrix<float,3,1> kai_b_old;
-  kai_b_old = Bii.colPivHouseholderQr().solve(kai_loc_sub);
+  if (!kai_loc_sub.allFinite())
+    return false;
 
-  assert((kai_loc_sub).isApprox(Bii*kai_b_old, 1e-5) && "Ax=b has no solution." && __LINE__);
+  Eigen::Matrix<float,3,1> kai_b_old;
+  kai_b_old = Bii.transpose()*kai_loc_sub;
 
   //Filter speed
   const float cf = 15e3f*std::exp(-float(int(level))),
@@ -890,9 +1163,9 @@ bool CLaserOdometry2D::filterLevelSolution()
   }
 
   //Transform filtered speed to local reference frame and compute transformation
-  Eigen::Matrix<float, 3, 1> kai_loc_fil = Bii.inverse().colPivHouseholderQr().solve(kai_b_fil);
-
-  assert((kai_b_fil).isApprox(Bii.inverse()*kai_loc_fil, 1e-5) && "Ax=b has no solution." && __LINE__);
+  Eigen::Matrix<float, 3, 1> kai_loc_fil = Bii*kai_b_fil;
+  if (!kai_loc_fil.allFinite())
+    return false;
 
   //transformation
   const float incrx = kai_loc_fil(0)/fps;
@@ -916,6 +1189,13 @@ bool CLaserOdometry2D::filterLevelSolution()
 */
 void CLaserOdometry2D::PoseUpdate()
 {
+  const double time_inc_sec = 1.0 / static_cast<double>(fps);
+  if (!std::isfinite(time_inc_sec) || time_inc_sec <= 0.0)
+  {
+    RCLCPP_WARN(logger_, "Invalid scan period. Pose is not updated");
+    return;
+  }
+
   // First, compute the overall transformation
   Eigen::Matrix3f acu_trans;
   acu_trans.setIdentity();
@@ -966,7 +1246,7 @@ void CLaserOdometry2D::PoseUpdate()
   kai_loc_old_(1) = -kai_abs_(0)*std::sin(phi) + kai_abs_(1)*std::cos(phi);
   kai_loc_old_(2) =  kai_abs_(2);
 
-  RCLCPP_INFO(get_logger(), "Laser odom [x,y,yaw]=[%f %f %f]",
+  RCLCPP_DEBUG(logger_, "Laser odom [x,y,yaw]=[%f %f %f]",
                 laser_pose_.translation()(0),
                 laser_pose_.translation()(1),
                 rf2o::getYaw(laser_pose_.rotation()));
@@ -974,7 +1254,7 @@ void CLaserOdometry2D::PoseUpdate()
   // Compose Transformations (robot odom)
   robot_pose_ = laser_pose_ * laser_pose_on_robot_inv_;
 
-  RCLCPP_INFO(get_logger(), "Robot-base odom [x,y,yaw]=[%f %f %f]",
+  RCLCPP_DEBUG(logger_, "Robot-base odom [x,y,yaw]=[%f %f %f]",
                 robot_pose_.translation()(0),
                 robot_pose_.translation()(1),
                 rf2o::getYaw(robot_pose_.rotation()));
@@ -983,21 +1263,12 @@ void CLaserOdometry2D::PoseUpdate()
   // last_scan -> the last scan received
   // last_odom_time -> The time of the previous scan lasser used to estimate the pose
   //-------------------------------------------------------------------------------------
-  double time_inc_sec = (current_scan_time - last_odom_time).seconds();
-  last_odom_time = current_scan_time;
-  lin_speed = acu_trans(0,2) / time_inc_sec;
-  //double lin_speed = sqrt( mrpt::math::square(robot_oldpose.x()-robot_pose.x()) + mrpt::math::square(robot_oldpose.y()-robot_pose.y()) )/time_inc_sec;
-
-  double ang_inc = rf2o::getYaw(robot_pose_.rotation()) -
-      rf2o::getYaw(robot_oldpose_.rotation());
-
-  if (ang_inc > 3.14159)
-    ang_inc -= 2*3.14159;
-  if (ang_inc < -3.14159)
-    ang_inc += 2*3.14159;
-
-  ang_speed = ang_inc/time_inc_sec;
+  const Pose3d robot_delta = robot_oldpose_.inverse() * robot_pose_;
+  lin_speed = robot_delta.translation().x() / time_inc_sec;
+  lin_speed_y = robot_delta.translation().y() / time_inc_sec;
+  ang_speed = rf2o::getYaw(robot_delta.rotation()) / time_inc_sec;
   robot_oldpose_ = robot_pose_;
+  last_odom_time = current_scan_time;
 
   //filter speeds
   /*

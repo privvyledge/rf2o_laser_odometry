@@ -21,6 +21,7 @@
 // std header
 #include <iostream>
 #include <fstream>
+#include <memory>
 #include <numeric>
 // ROS headers
 #include <rclcpp/rclcpp.hpp>
@@ -70,18 +71,21 @@ using MatrixS31 = Eigen::Matrix<Scalar, 3, 1>;
 using IncrementCov = Eigen::Matrix<Scalar, 3, 3>;
 
 
-class CLaserOdometry2D: public rclcpp::Node
+class CLaserOdometry2D
 {
 public:
 
-  CLaserOdometry2D();
+  explicit CLaserOdometry2D(
+    const rclcpp::Logger& logger = rclcpp::get_logger("CLaserOdometry2D"),
+    const rclcpp::Clock::SharedPtr& clock = std::make_shared<rclcpp::Clock>(RCL_ROS_TIME));
 
-  void init(const sensor_msgs::msg::LaserScan& scan,
+  bool init(const sensor_msgs::msg::LaserScan& scan,
             const geometry_msgs::msg::Pose& initial_robot_pose);
 
   bool is_initialized();
 
   bool odometryCalculation(const sensor_msgs::msg::LaserScan& scan);
+  bool sanitizeScanRanges(const sensor_msgs::msg::LaserScan& scan);
 
   void setLaserPose(const Pose3d& laser_pose);
 
@@ -91,6 +95,8 @@ public:
 
   Pose3d& getPose();
   const Pose3d& getPose() const;
+  rclcpp::Logger logger_;
+  rclcpp::Clock::SharedPtr clock_;
   bool verbose, module_initialized, first_laser_scan;
   rclcpp::Time last_odom_time, current_scan_time;
 
@@ -135,7 +141,7 @@ public:
   unsigned int iter_irls;
   float g_mask[5];
 
-  double lin_speed, ang_speed;
+  double lin_speed, lin_speed_y, ang_speed;
 
   //rclcpp::wall	m_runtime;
 
@@ -164,8 +170,8 @@ public:
   void computeNormals();
   void computeWeights();
   void findNullPoints();
-  void solveSystemOneLevel();
-  void solveSystemNonLinear();
+  bool solveSystemOneLevel();
+  bool solveSystemNonLinear();
   bool filterLevelSolution();
   void PoseUpdate();
   void Reset(const Pose3d& ini_pose/*, CObservation2DRangeScan scan*/);
