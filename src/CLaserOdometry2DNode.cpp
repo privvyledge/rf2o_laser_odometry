@@ -81,7 +81,10 @@ CLaserOdometry2DNode::CLaserOdometry2DNode(const rclcpp::NodeOptions & options):
   //---------------------------------
   buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
   tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*buffer_);
-  odom_broadcaster = std::make_unique<tf2_ros::TransformBroadcaster>(this);
+  if (publish_tf)
+  {
+    odom_broadcaster = std::make_unique<tf2_ros::TransformBroadcaster>(this);
+  }
   odom_pub  = this->create_publisher<nav_msgs::msg::Odometry>(odom_topic, 5);
   laser_sub = this->create_subscription<sensor_msgs::msg::LaserScan>(laser_scan_topic,rclcpp::QoS(rclcpp::KeepLast(1)).best_effort().durability_volatile(),
       std::bind(&CLaserOdometry2DNode::LaserCallBack, this, std::placeholders::_1));
@@ -301,7 +304,7 @@ void CLaserOdometry2DNode::publish()
   odom_pub->publish(odom);
 
   // 2. publish over tf? (one one node should publish this transform!)
-  if (publish_tf)
+  if (publish_tf && odom_broadcaster)
   {
     RCLCPP_DEBUG(get_logger(), "Publishing TF: [base_link] to [odom]");
     geometry_msgs::msg::TransformStamped odom_trans;
