@@ -66,6 +66,7 @@ CLaserOdometry2DNode::CLaserOdometry2DNode(const rclcpp::NodeOptions & options):
   this->get_parameter("twist_covariance_diagonal", twist_covariance_diagonal);
   this->declare_parameter<double>("covariance_scale", 1.0);
   this->get_parameter("covariance_scale", covariance_scale);
+  declareZeroVelocityParameters();
 
   if (!covarianceDiagonalValid(pose_covariance_diagonal, "pose_covariance_diagonal"))
     pose_covariance_diagonal = {0.0025, 0.0025, 1000000.0, 1000000.0, 1000000.0, 0.0025};
@@ -113,6 +114,12 @@ CLaserOdometry2DNode::CLaserOdometry2DNode(const rclcpp::NodeOptions & options):
   rf2o_ref.module_initialized = false;
   rf2o_ref.first_laser_scan   = true;
   new_scan_available = false;
+
+  zv_external_received = false;
+  zv_external_stamp    = rclcpp::Time(0, 0, get_clock()->get_clock_type());
+  zv_external_linear   = 0.0;
+  zv_external_angular  = 0.0;
+  subscribeZeroVelocityTwist();
 
   // Create processing timer
   const auto period = std::chrono::duration<double>(1.0 / freq);
@@ -229,8 +236,13 @@ bool CLaserOdometry2DNode::scan_available()
 void CLaserOdometry2DNode::process()
 {
   // Do only run when a new scan is ready 
+  // The publisher of the optional confirmation topic may appear after this node.
+  subscribeZeroVelocityTwist();
+
   if( rf2o_ref.is_initialized() && scan_available() )
   {
+    rf2o_ref.zv_external_still = externalConfirmsStationary();
+
     // Process odometry estimation
     const bool odometry_updated = rf2o_ref.odometryCalculation(*last_scan);
 
@@ -266,6 +278,179 @@ void CLaserOdometry2DNode::initPoseCallBack(const nav_msgs::msg::Odometry::Share
   }
 }
 
+
+void CLaserOdometry2DNode::declareZeroVelocityParameters()
+{
+  this->declare_parameter<bool>("enable_zero_velocity_detection", true);
+  this->get_parameter("enable_zero_velocity_detection", rf2o_ref.zv_enabled);
+  this->declare_parameter<double>("zero_velocity_linear_threshold", 0.02);
+  this->get_parameter("zero_velocity_linear_threshold", rf2o_ref.zv_linear_threshold);
+  this->declare_parameter<double>("zero_velocity_angular_threshold", 0.05);
+  this->get_parameter("zero_velocity_angular_threshold", rf2o_ref.zv_angular_threshold);
+  this->declare_parameter<double>("zero_velocity_scan_diff_threshold", 0.03);
+  this->get_parameter("zero_velocity_scan_diff_threshold", rf2o_ref.zv_scan_diff_threshold);
+  this->declare_parameter<int>("zero_velocity_hold_scans", 3);
+  this->get_parameter("zero_velocity_hold_scans", rf2o_ref.zv_hold_scans);
+  this->declare_parameter<int>("zero_velocity_release_scans", 2);
+  this->get_parameter("zero_velocity_release_scans", rf2o_ref.zv_release_scans);
+  this->declare_parameter<std::string>("zero_velocity_twist_topic", "");
+  this->get_parameter("zero_velocity_twist_topic", zero_velocity_twist_topic);
+  this->declare_parameter<std::string>("zero_velocity_twist_type", "auto");
+  this->get_parameter("zero_velocity_twist_type", zero_velocity_twist_type);
+  this->declare_parameter<double>("zero_velocity_twist_timeout", 0.5);
+  this->get_parameter("zero_velocity_twist_timeout", zero_velocity_twist_timeout);
+
+  if (!std::isfinite(rf2o_ref.zv_linear_threshold) || rf2o_ref.zv_linear_threshold < 0.0)
+  {
+    RCLCPP_WARN(get_logger(), "Invalid zero_velocity_linear_threshold; using 0.02 m/s");
+    rf2o_ref.zv_linear_threshold = 0.02;
+  }
+  if (!std::isfinite(rf2o_ref.zv_angular_threshold) || rf2o_ref.zv_angular_threshold < 0.0)
+  {
+    RCLCPP_WARN(get_logger(), "Invalid zero_velocity_angular_threshold; using 0.05 rad/s");
+    rf2o_ref.zv_angular_threshold = 0.05;
+  }
+  if (!std::isfinite(rf2o_ref.zv_scan_diff_threshold))
+  {
+    RCLCPP_WARN(get_logger(), "Invalid zero_velocity_scan_diff_threshold; using 0.03 m");
+    rf2o_ref.zv_scan_diff_threshold = 0.03;
+  }
+  if (rf2o_ref.zv_hold_scans < 1)
+  {
+    RCLCPP_WARN(get_logger(), "Invalid zero_velocity_hold_scans; using 1");
+    rf2o_ref.zv_hold_scans = 1;
+  }
+  if (rf2o_ref.zv_release_scans < 1)
+  {
+    RCLCPP_WARN(get_logger(), "Invalid zero_velocity_release_scans; using 1");
+    rf2o_ref.zv_release_scans = 1;
+  }
+  if (!std::isfinite(zero_velocity_twist_timeout) || zero_velocity_twist_timeout <= 0.0)
+  {
+    RCLCPP_WARN(get_logger(), "Invalid zero_velocity_twist_timeout; using 0.5 s");
+    zero_velocity_twist_timeout = 0.5;
+  }
+}
+
+/**
+ * Subscribes to the optional external velocity topic. Any of Twist,
+ * TwistStamped, TwistWithCovarianceStamped or Odometry is accepted; with
+ * zero_velocity_twist_type set to "auto" the type is taken from whoever is
+ * publishing, which means the subscription can only be created once a publisher
+ * exists. process() retries until then.
+*/
+void CLaserOdometry2DNode::subscribeZeroVelocityTwist()
+{
+  if (zero_velocity_twist_topic.empty())
+    return;
+
+  if (zv_twist_sub || zv_twist_stamped_sub || zv_twist_cov_sub || zv_odom_sub)
+    return;
+
+  std::string type = zero_velocity_twist_type;
+
+  if (type.empty() || type == "auto")
+  {
+    const auto publishers = this->get_publishers_info_by_topic(zero_velocity_twist_topic);
+    if (publishers.empty())
+    {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 5000,
+        "Waiting for a publisher on zero_velocity_twist_topic [%s] to resolve its type",
+        zero_velocity_twist_topic.c_str());
+      return;
+    }
+    type = publishers.front().topic_type();
+  }
+
+  const auto qos = rclcpp::QoS(rclcpp::KeepLast(1)).best_effort().durability_volatile();
+
+  if (type == "geometry_msgs/msg/Twist")
+  {
+    zv_twist_sub = this->create_subscription<geometry_msgs::msg::Twist>(
+      zero_velocity_twist_topic, qos,
+      [this](const geometry_msgs::msg::Twist::SharedPtr msg)
+      { zeroVelocityTwistCallBack(*msg); });
+  }
+  else if (type == "geometry_msgs/msg/TwistStamped")
+  {
+    zv_twist_stamped_sub = this->create_subscription<geometry_msgs::msg::TwistStamped>(
+      zero_velocity_twist_topic, qos,
+      [this](const geometry_msgs::msg::TwistStamped::SharedPtr msg)
+      { zeroVelocityTwistCallBack(msg->twist); });
+  }
+  else if (type == "geometry_msgs/msg/TwistWithCovarianceStamped")
+  {
+    zv_twist_cov_sub = this->create_subscription<geometry_msgs::msg::TwistWithCovarianceStamped>(
+      zero_velocity_twist_topic, qos,
+      [this](const geometry_msgs::msg::TwistWithCovarianceStamped::SharedPtr msg)
+      { zeroVelocityTwistCallBack(msg->twist.twist); });
+  }
+  else if (type == "nav_msgs/msg/Odometry")
+  {
+    zv_odom_sub = this->create_subscription<nav_msgs::msg::Odometry>(
+      zero_velocity_twist_topic, qos,
+      [this](const nav_msgs::msg::Odometry::SharedPtr msg)
+      { zeroVelocityTwistCallBack(msg->twist.twist); });
+  }
+  else
+  {
+    RCLCPP_ERROR(
+      get_logger(),
+      "Unsupported type [%s] on zero_velocity_twist_topic [%s]; expected Twist, TwistStamped, "
+      "TwistWithCovarianceStamped or Odometry. External confirmation is disabled.",
+      type.c_str(), zero_velocity_twist_topic.c_str());
+    zero_velocity_twist_topic.clear();
+    return;
+  }
+
+  RCLCPP_INFO(get_logger(), "Zero-velocity confirmation from [%s] of type [%s]",
+              zero_velocity_twist_topic.c_str(), type.c_str());
+}
+
+void CLaserOdometry2DNode::zeroVelocityTwistCallBack(const geometry_msgs::msg::Twist& twist)
+{
+  // Unstamped messages carry no time of their own, and the stamp is only used
+  // to reject stale data, so reception time is used throughout.
+  zv_external_stamp    = this->now();
+  zv_external_linear   = std::hypot(twist.linear.x, twist.linear.y);
+  zv_external_angular  = std::abs(twist.angular.z);
+  zv_external_received = true;
+}
+
+/**
+ * Returns whether the external signal, if any, agrees that the robot is still.
+ * A missing or stale signal is treated as "no opinion" rather than as motion:
+ * the external topic exists to veto a scan-derived decision, so a dead
+ * publisher must not silently disable the gate's own detection.
+*/
+bool CLaserOdometry2DNode::externalConfirmsStationary()
+{
+  if (zero_velocity_twist_topic.empty())
+    return true;
+
+  if (!zv_external_received)
+  {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 5000,
+      "No message yet on zero_velocity_twist_topic [%s]; using scan-only detection",
+      zero_velocity_twist_topic.c_str());
+    return true;
+  }
+
+  const double age = (this->now() - zv_external_stamp).seconds();
+  if (age > zero_velocity_twist_timeout)
+  {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 5000,
+      "zero_velocity_twist_topic [%s] is stale by %.2f s; using scan-only detection",
+      zero_velocity_twist_topic.c_str(), age);
+    return true;
+  }
+
+  return zv_external_linear  < rf2o_ref.zv_linear_threshold &&
+         zv_external_angular < rf2o_ref.zv_angular_threshold;
+}
 
 /**
  * Publish current odocmetry estimation over ROS

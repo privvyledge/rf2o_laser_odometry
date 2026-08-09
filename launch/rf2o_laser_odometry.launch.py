@@ -17,7 +17,16 @@ def generate_launch_description():
         'base_frame_id' : 'base_link',
         'odom_frame_id' : 'odom',
         'init_pose_from_topic' : '',
-        'freq' : 20.0}]
+        'freq' : 20.0,
+        'enable_zero_velocity_detection' : True,
+        'zero_velocity_linear_threshold' : 0.02,
+        'zero_velocity_angular_threshold' : 0.05,
+        'zero_velocity_scan_diff_threshold' : 0.03,
+        'zero_velocity_hold_scans' : 3,
+        'zero_velocity_release_scans' : 2,
+        'zero_velocity_twist_topic' : '',
+        'zero_velocity_twist_type' : 'auto',
+        'zero_velocity_twist_timeout' : 0.5}]
 
     return LaunchDescription([
             DeclareLaunchArgument(

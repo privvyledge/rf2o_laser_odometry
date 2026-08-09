@@ -73,9 +73,21 @@ CLaserOdometry2D::CLaserOdometry2D(const rclcpp::Logger& logger,
   laser_pose_(Pose3d::Identity()),
   laser_oldpose_(Pose3d::Identity()),
   robot_pose_(Pose3d::Identity()),
-  robot_oldpose_(Pose3d::Identity())
+  robot_oldpose_(Pose3d::Identity()),
+  zv_enabled(true),
+  zv_linear_threshold(0.02),
+  zv_angular_threshold(0.05),
+  zv_scan_diff_threshold(0.03),
+  zv_hold_scans(3),
+  zv_release_scans(2),
+  zv_external_still(true),
+  zv_stationary_(false),
+  zv_still_count_(0),
+  zv_moving_count_(0),
+  zv_scan_diff_(0.0),
+  zv_scan_diff_valid_(false)
 {
-  
+
 }
 
 
@@ -221,6 +233,12 @@ bool CLaserOdometry2D::init(const sensor_msgs::msg::LaserScan& scan,
   kai_abs_     = MatrixS31::Zero();
   kai_loc_old_ = MatrixS31::Zero();
 
+  zv_stationary_      = false;
+  zv_still_count_     = 0;
+  zv_moving_count_    = 0;
+  zv_scan_diff_       = 0.0;
+  zv_scan_diff_valid_ = false;
+
   if (!sanitizeScanRanges(scan))
   {
     RCLCPP_WARN(logger_, "Failed to sanitize initial laser scan");
@@ -320,11 +338,17 @@ bool CLaserOdometry2D::odometryCalculation(const sensor_msgs::msg::LaserScan& sc
     return false;
   }
 
+  // range_wf still holds the sanitized ranges of the previous scan at this point;
+  // keep them to measure how much the scan changed before they are overwritten.
+  const Eigen::MatrixXf previous_range_wf = range_wf;
+
   if (!sanitizeScanRanges(scan))
   {
     RCLCPP_WARN_THROTTLE(logger_, *clock_, 5000, "Rejecting laser scan that could not be sanitized");
     return false;
   }
+
+  updateScanDifference(previous_range_wf);
 
   // Keep record of times
   auto start = clock_->now();
@@ -1184,6 +1208,108 @@ bool CLaserOdometry2D::filterLevelSolution()
 
 
 /**
+ * Measures how much the scan changed with respect to the previous one.
+ * Two consecutive scans from a static sensor are near-identical, so the mean
+ * absolute range difference over the beams that are valid in both is a motion
+ * cue that is independent of the scan-matching solution.
+*/
+void CLaserOdometry2D::updateScanDifference(const Eigen::MatrixXf& previous_range_wf)
+{
+  zv_scan_diff_       = 0.0;
+  zv_scan_diff_valid_ = false;
+
+  if (previous_range_wf.size() != range_wf.size())
+    return;
+
+  double sum = 0.0;
+  unsigned int count = 0;
+
+  for (int i = 0; i < range_wf.size(); ++i)
+  {
+    // sanitizeScanRanges() zeroes out the beams it rejected.
+    if (previous_range_wf(i) <= 0.f || range_wf(i) <= 0.f)
+      continue;
+
+    sum += std::abs(double(range_wf(i)) - double(previous_range_wf(i)));
+    ++count;
+  }
+
+  // Too few shared beams to say anything; leave the result invalid so that the
+  // gate falls back to refusing a stationary decision.
+  if (count < 10)
+    return;
+
+  zv_scan_diff_       = sum / double(count);
+  zv_scan_diff_valid_ = std::isfinite(zv_scan_diff_);
+}
+
+/**
+ * Decides whether the scan pair that was just solved indicates no motion.
+ *
+ * Both edges are held: entering needs zv_hold_scans consecutive still scans so
+ * that a single quiet pair cannot latch the gate, and leaving needs
+ * zv_release_scans consecutive moving ones so that an isolated noise spike just
+ * over a threshold cannot unlatch it. The release count is the smaller of the
+ * two, because while it counts down a genuine manoeuvre is being suppressed.
+*/
+bool CLaserOdometry2D::updateZeroVelocityState()
+{
+  if (!zv_enabled)
+  {
+    zv_stationary_   = false;
+    zv_still_count_  = 0;
+    zv_moving_count_ = 0;
+    return false;
+  }
+
+  const double solved_linear  = std::hypot(double(kai_loc_(0)), double(kai_loc_(1)));
+  const double solved_angular = std::abs(double(kai_loc_(2)));
+
+  bool still =
+    std::isfinite(solved_linear) && std::isfinite(solved_angular) &&
+    solved_linear  < zv_linear_threshold &&
+    solved_angular < zv_angular_threshold;
+
+  // Cross-check the solver against the raw scans.
+  if (still && zv_scan_diff_threshold > 0.0)
+    still = zv_scan_diff_valid_ && (zv_scan_diff_ < zv_scan_diff_threshold);
+
+  // Optional external signal. It can only veto a scan-derived decision, never
+  // produce one on its own.
+  if (still)
+    still = zv_external_still;
+
+  if (still)
+  {
+    ++zv_still_count_;
+    zv_moving_count_ = 0;
+  }
+  else
+  {
+    ++zv_moving_count_;
+    zv_still_count_ = 0;
+  }
+
+  const int hold    = std::max(1, zv_hold_scans);
+  const int release = std::max(1, zv_release_scans);
+
+  if (!zv_stationary_ && zv_still_count_ >= hold)
+  {
+    zv_stationary_ = true;
+    RCLCPP_INFO(logger_, "Zero-velocity detected; holding pose (scan diff %.4f m)", zv_scan_diff_);
+  }
+  else if (zv_stationary_ && zv_moving_count_ >= release)
+  {
+    zv_stationary_ = false;
+    RCLCPP_INFO(logger_, "Motion detected; resuming pose integration "
+                         "(v %.4f m/s, w %.4f rad/s, scan diff %.4f m)",
+                solved_linear, solved_angular, zv_scan_diff_);
+  }
+
+  return zv_stationary_;
+}
+
+/**
  * Updates the laser and robot poses after analyzing the last scan
  * To do so, we need to analyze the coarse2fine pyramid
 */
@@ -1216,6 +1342,35 @@ void CLaserOdometry2D::PoseUpdate()
   }
 
   //cout << endl << "Arc cos (incr tita): " << kai_loc_(2);
+
+  //			Zero-velocity gate
+  //--------------------------------------------------------
+  // kai_loc_ is the solved velocity for this scan pair. When it is only noise
+  // the pose is held instead of integrated, otherwise that noise accumulates as
+  // a random walk. Time still advances so that the node keeps publishing at its
+  // normal rate with a zero twist.
+  if (updateZeroVelocityState())
+  {
+    laser_oldpose_  = laser_pose_;
+    robot_oldpose_  = robot_pose_;
+    last_increment_ = Pose3d::Identity();
+
+    kai_loc_.setZero();
+    kai_abs_.setZero();
+    kai_loc_old_.setZero();
+
+    lin_speed   = 0.0;
+    lin_speed_y = 0.0;
+    ang_speed   = 0.0;
+
+    last_odom_time = current_scan_time;
+
+    RCLCPP_DEBUG(logger_, "Stationary; pose held at [x,y,yaw]=[%f %f %f]",
+                 robot_pose_.translation()(0),
+                 robot_pose_.translation()(1),
+                 rf2o::getYaw(robot_pose_.rotation()));
+    return;
+  }
 
   float phi = rf2o::getYaw(laser_pose_.rotation());
 

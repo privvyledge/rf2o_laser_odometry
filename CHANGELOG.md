@@ -1,5 +1,22 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- Added scan-derived zero-velocity detection. A stationary scanner still produces a small, sign-random scan-matching solution, and integrating it made the reported pose perform an unbounded random walk. The pose increment is now suppressed while consecutive scans indicate no motion, configured through:
+  - `enable_zero_velocity_detection`
+  - `zero_velocity_linear_threshold`
+  - `zero_velocity_angular_threshold`
+  - `zero_velocity_scan_diff_threshold`
+  - `zero_velocity_hold_scans`
+  - `zero_velocity_release_scans`
+- Added an optional external velocity input through `zero_velocity_twist_topic`, `zero_velocity_twist_type` and `zero_velocity_twist_timeout`. It accepts `geometry_msgs/msg/Twist`, `geometry_msgs/msg/TwistStamped`, `geometry_msgs/msg/TwistWithCovarianceStamped` and `nav_msgs/msg/Odometry`, resolving the type from the publisher by default. It can only confirm a scan-derived stationary decision, never produce one, so the node stays self-contained and behaves identically across robots when unset.
+
+### Changed
+
+- While the zero-velocity gate is engaged the node keeps publishing at its normal rate with the pose held and the twist set to exactly zero, rather than going silent.
+
 ## [Released] - 2026-05-26
 
 ### Added

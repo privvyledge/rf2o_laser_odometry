@@ -13,6 +13,10 @@
 #include <tf2/utils.h>
 #include <rclcpp/rclcpp.hpp>
 
+#include <geometry_msgs/msg/twist.hpp>
+#include <geometry_msgs/msg/twist_stamped.hpp>
+#include <geometry_msgs/msg/twist_with_covariance_stamped.hpp>
+
 #include <array>
 #include <vector>
 
@@ -41,6 +45,11 @@ public:
   std::vector<double> pose_covariance_diagonal;
   std::vector<double> twist_covariance_diagonal;
 
+  // Optional external confirmation of a scan-derived stationary decision.
+  std::string         zero_velocity_twist_topic;
+  std::string         zero_velocity_twist_type;
+  double              zero_velocity_twist_timeout;
+
   sensor_msgs::msg::LaserScan::SharedPtr          last_scan;
   bool                                            GT_pose_initialized;
   std::shared_ptr<tf2_ros::Buffer>                buffer_;
@@ -54,9 +63,27 @@ public:
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr         odom_pub;
   rclcpp::TimerBase::SharedPtr                                  timer_;
 
+  // Only one of these is created, according to the type published on
+  // zero_velocity_twist_topic.
+  rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr                       zv_twist_sub;
+  rclcpp::Subscription<geometry_msgs::msg::TwistStamped>::SharedPtr                zv_twist_stamped_sub;
+  rclcpp::Subscription<geometry_msgs::msg::TwistWithCovarianceStamped>::SharedPtr  zv_twist_cov_sub;
+  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr                         zv_odom_sub;
+
   // CallBacks
   void LaserCallBack(const sensor_msgs::msg::LaserScan::SharedPtr new_scan);
   void initPoseCallBack(const nav_msgs::msg::Odometry::SharedPtr new_initPose);
+
+  // Zero-velocity external confirmation
+  void declareZeroVelocityParameters();
+  void subscribeZeroVelocityTwist();
+  void zeroVelocityTwistCallBack(const geometry_msgs::msg::Twist& twist);
+  bool externalConfirmsStationary();
+
+  bool          zv_external_received;
+  rclcpp::Time  zv_external_stamp;
+  double        zv_external_linear;
+  double        zv_external_angular;
 
   void fillConfiguredCovariance(std::array<double, 36>& covariance,
                                 const std::vector<double>& diagonal);

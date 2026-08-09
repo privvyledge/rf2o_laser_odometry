@@ -87,6 +87,10 @@ public:
   bool odometryCalculation(const sensor_msgs::msg::LaserScan& scan);
   bool sanitizeScanRanges(const sensor_msgs::msg::LaserScan& scan);
 
+  /// True when the last processed scan pair was classified as stationary and
+  /// its solved increment was therefore not integrated.
+  bool isStationary() const { return zv_stationary_; }
+
   void setLaserPose(const Pose3d& laser_pose);
 
   const Pose3d& getIncrement() const;
@@ -162,6 +166,22 @@ public:
   std::vector<double> last_m_lin_speeds;
   std::vector<double> last_m_ang_speeds;
 
+  // Zero-velocity detection
+  //------------------------
+  // A stationary scanner still produces a small, sign-random scan-matching
+  // solution. Integrating it turns that noise into an unbounded random walk in
+  // the reported pose, so the increment is suppressed while no motion is
+  // detected. Configuration is owned by the node and read from parameters.
+  bool   zv_enabled;                  // master switch
+  double zv_linear_threshold;         // m/s, solved translation below this counts as still
+  double zv_angular_threshold;        // rad/s, solved rotation below this counts as still
+  double zv_scan_diff_threshold;      // m, mean |range difference| between consecutive
+                                      // scans below this counts as still; <=0 disables
+  int    zv_hold_scans;               // consecutive still scans before latching
+  int    zv_release_scans;            // consecutive moving scans before releasing
+  bool   zv_external_still;           // optional external confirmation; a false value
+                                      // vetoes a scan-derived stationary decision
+
   // Methods
   void createImagePyramid();
   void calculateCoord();
@@ -175,6 +195,17 @@ public:
   bool filterLevelSolution();
   void PoseUpdate();
   void Reset(const Pose3d& ini_pose/*, CObservation2DRangeScan scan*/);
+
+  void updateScanDifference(const Eigen::MatrixXf& previous_range_wf);
+  bool updateZeroVelocityState();
+
+private:
+
+  bool   zv_stationary_;        // latched decision
+  int    zv_still_count_;       // consecutive scans classified still
+  int    zv_moving_count_;      // consecutive scans classified moving
+  double zv_scan_diff_;         // mean |range difference| of the last scan pair
+  bool   zv_scan_diff_valid_;   // false when too few beams were valid in both scans
 };
 
 } /* namespace rf2o */

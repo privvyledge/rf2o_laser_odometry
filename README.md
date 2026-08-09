@@ -90,6 +90,30 @@ Use the same ROS parameters listed below when loading the component into a conta
 | `twist_covariance_diagonal` | double array, length 6 | `[0.01, 0.01, 1000000.0, 1000000.0, 1000000.0, 0.01]` | Twist covariance diagonal for vx, vy, vz, vroll, vpitch, vyaw. |
 | `use_rf2o_twist_covariance` | bool | `false` | Use the RF2O solver covariance for planar twist covariance when it is finite. |
 | `covariance_scale` | double | `1.0` | Positive scale applied to RF2O-derived twist covariance. |
+| `enable_zero_velocity_detection` | bool | `true` | Suppress the pose increment while consecutive scans indicate no motion. |
+| `zero_velocity_linear_threshold` | double | `0.02` | Solved translational speed in m/s below which a scan pair counts as still. |
+| `zero_velocity_angular_threshold` | double | `0.05` | Solved rotational speed in rad/s below which a scan pair counts as still. |
+| `zero_velocity_scan_diff_threshold` | double | `0.03` | Mean absolute range difference in m between consecutive scans below which they count as still. Set to zero or less to disable this cross-check. |
+| `zero_velocity_hold_scans` | int | `3` | Consecutive still scans required before the gate engages. |
+| `zero_velocity_release_scans` | int | `2` | Consecutive moving scans required before the gate releases. |
+| `zero_velocity_twist_topic` | string | `""` | Optional external velocity topic used only to confirm a scan-derived stationary decision. Empty disables it. |
+| `zero_velocity_twist_type` | string | `auto` | Message type on that topic. `auto` takes it from the publisher. Accepts `geometry_msgs/msg/Twist`, `geometry_msgs/msg/TwistStamped`, `geometry_msgs/msg/TwistWithCovarianceStamped` and `nav_msgs/msg/Odometry`. |
+| `zero_velocity_twist_timeout` | double | `0.5` | Age in seconds after which the external signal is ignored. |
+
+## Zero-velocity detection
+
+A stationary scanner still produces a small scan-matching solution whose sign varies from scan to scan. Integrating it turns sensor noise into an unbounded random walk in the reported pose, which is most visible as yaw drift on a parked robot. The node therefore classifies each scan pair before integrating it, and holds the pose while the pair looks stationary.
+
+Two independent cues must agree:
+
+1. the solved translational and rotational speed for the pair, compared against `zero_velocity_linear_threshold` and `zero_velocity_angular_threshold`;
+2. the mean absolute range difference between the two scans over the beams that are valid in both, compared against `zero_velocity_scan_diff_threshold`. This does not depend on the solver, so it also catches a solver that wrongly reports near-zero motion.
+
+Both edges are held, by `zero_velocity_hold_scans` when engaging and `zero_velocity_release_scans` when releasing, so that neither a single quiet scan pair nor an isolated noise spike can chatter the gate.
+
+While the gate is engaged the node keeps publishing at its normal rate: the pose is held at its last value and the twist is exactly zero. It never stops publishing, so a rate-based health check still sees a live source.
+
+`zero_velocity_twist_topic` is optional and off by default. When set, the external velocity can only veto a stationary decision that the scans already produced; it can never declare the robot stationary on its own, and a missing or stale signal leaves detection scan-only. This keeps the node usable standalone and identical across robots.
 
 ## Topics and frames
 
@@ -97,6 +121,7 @@ Subscribed topics:
 
 - `laser_scan_topic` (`sensor_msgs/msg/LaserScan`)
 - `init_pose_from_topic` (`nav_msgs/msg/Odometry`), only when configured
+- `zero_velocity_twist_topic` (`geometry_msgs/msg/Twist`, `geometry_msgs/msg/TwistStamped`, `geometry_msgs/msg/TwistWithCovarianceStamped` or `nav_msgs/msg/Odometry`), only when configured
 
 Published topics:
 
